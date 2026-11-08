@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "pushgateway-data") }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.pushgateway.storage.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.pushgateway.storage.size | quote }}

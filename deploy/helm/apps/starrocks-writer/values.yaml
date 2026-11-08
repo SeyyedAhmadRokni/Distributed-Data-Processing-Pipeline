@@ -1,0 +1,60 @@
+replicaCount: 3
+
+image:
+  repository: registry.example.com:9465/tmnt/starrocks-writer
+  pullPolicy: Always
+  tag: ""
+
+metrics:
+  port: 8380
+
+env:
+  JAVA_TOOL_OPTIONS: "-Xms128m -Xmx768m -XX:+ExitOnOutOfMemoryError"
+
+credentials:
+  username: root
+  password: changeme
+
+config:
+  kafka:
+    kafka.topic: "multi-version-netflow"
+    bootstrap.servers: "192.168.1.101:9092,192.168.1.102:9092,192.168.1.103:9092,192.168.1.104:9092"
+    group.id: "netflow-starrocks-writer"
+    auto.offset.reset: "earliest"
+    enable.auto.commit: "false"
+    max.poll.records: "100000"
+    max.partition.fetch.bytes: "67108864"
+    fetch.min.bytes: "5242880"
+    fetch.max.wait.ms: "500"
+    receive.buffer.bytes: "10485760"
+    send.buffer.bytes: "10485760"
+    max.poll.interval.ms: "1800000"
+    key.deserializer: "org.apache.kafka.common.serialization.ByteArrayDeserializer"
+    value.deserializer: "io.confluent.kafka.serializers.KafkaAvroDeserializer"
+    schema.registry.url: "http://schema-registry:8081"
+    specific.avro.reader: "false"
+    key.serializer: "org.apache.kafka.common.serialization.ByteArraySerializer"
+    value.serializer: "io.confluent.kafka.serializers.KafkaAvroSerializer"
+    acks: "all"
+    linger.ms: "10"
+    batch.size: "131072"
+    consumer.max.invalid.batch.size: "5000000"
+    consumer.retry.backoff.ms: "1000"
+    consumer.poll.timeout.ms: "10000"
+    buffer.flush.interval.ms: "100"
+  starrocks:
+    starrocks.fe.hosts: "192.168.1.104,192.168.1.102,192.168.1.103,192.168.1.101"
+    starrocks.http.port: "8030"
+    starrocks.database: "nimbo"
+    starrocks.table: "netflow_raw"
+    starrocks.batch.max.records: "100000"
+    starrocks.connect.timeout.ms: "3000"
+    starrocks.request.timeout.ms: "60000"
+
+terminationGracePeriodSeconds: 270
+
+resources:
+  requests:
+    memory: 1Gi
+  limits:
+    memory: 1536Mi

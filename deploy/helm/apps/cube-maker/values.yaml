@@ -1,0 +1,58 @@
+# Start at 00:00, 06:00, 12:00 and 18:00 in the configured time zone.
+schedule: "0 */6 * * *"
+timeZone: "UTC"
+concurrencyPolicy: Forbid
+successfulJobsHistoryLimit: 3
+failedJobsHistoryLimit: 3
+backoffLimit: 2
+activeDeadlineSeconds: 240
+replicaCount: 1
+
+config:
+  # Wait this many hours after an hourly directory's hour ends before processing it.
+  cube.directory.settling.hours: "2"
+  spark.app.name: "cube-maker"
+  spark.cores.max: "8"
+  spark.executor.cores: "2"
+  spark.executor.memory: "1g"
+  spark.dynamicAllocation.enabled: "false"
+  spark.eventLog.enabled: "true"
+  spark.eventLog.dir: "hdfs://hacluster/spark-event-logs"
+
+image:
+  repository: registry.example.com:9465/tmnt/cube-maker
+  pullPolicy: Always
+  tag: "latest"
+
+metrics:
+  port: 8380
+
+pushGateway:
+  address: monitoring-pushgateway:9091
+
+driver:
+  port: 7078
+  blockManagerPort: 7079
+
+env:
+  SPARK_MASTER: "spark://spark-master:7077"
+  PARQUET_BASE_PATH: "/netflow/"
+  HADOOP_USER_NAME: "hadoop"
+  HDFS_DEFAULT_FS: "hdfs://hacluster"
+  POSTGRES_URL: "jdbc:postgresql://postgres:5432/netflow_cube_db"
+  POSTGRES_USERNAME: "postgres"
+  POSTGRES_PASSWORD: "postgres"
+  # Retries after the initial connection attempt; 0 disables retries.
+  POSTGRES_CONNECTION_RETRY_COUNT: "4"
+  POSTGRES_CONNECTION_RETRY_DELAY_MS: "1000"
+  HDFS_TIMEZONE: "UTC"
+
+hadoopConfig:
+  dfs.nameservices: "hacluster"
+  dfs.ha.namenodes.hacluster: "namenode1,namenode2,namenode3"
+  dfs.namenode.rpc-address.hacluster.namenode1: "namenode1:8020"
+  dfs.namenode.rpc-address.hacluster.namenode2: "namenode2:8020"
+  dfs.namenode.rpc-address.hacluster.namenode3: "namenode3:8020"
+  dfs.client.failover.proxy.provider.hacluster: "org.apache.hadoop.hdfs.server.namenode.ha.ConfiguredFailoverProxyProvider"
+
+terminationGracePeriodSeconds: 120

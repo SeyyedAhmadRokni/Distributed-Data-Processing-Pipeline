@@ -1,0 +1,14 @@
+---
+java_url: "https://nexus.example.com/repository/Raw-Hosted/dist/java/jdk-17.0.6_linux-x64_bin.tar.gz"
+java_home: "/opt/java"
+
+kafka_version: "3.7.2"
+scala_version: "2.13"
+kafka_download_mirror: "https://nexus.example.com/repository/Raw-Hosted/dist"
+kafka_url: "{{ kafka_download_mirror }}/kafka_{{ scala_version }}-{{ kafka_version }}.tgz"
+
+kafka_dir: "/opt/kafka"
+kafka_data_dir: "/mnt/disk1/kafka/data"
+
+cluster_id: ""
+controller_quorum_voters: "1@192.168.1.101:9093,2@192.168.1.102:9093,3@192.168.1.103:9093,4@192.168.1.104:9093"

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "prometheus-data") }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: {{ .Values.prometheus.storage.storageClass | quote }}
+  resources:
+    requests:
+      storage: {{ .Values.prometheus.storage.size | quote }}

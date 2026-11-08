@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana") }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+
+  selector:
+    matchLabels:
+      app: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana") }}
+
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/grafana/grafana-configmap.yaml") . | sha256sum }}
+      labels:
+        app: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana") }}
+
+    spec:
+      securityContext:
+        fsGroup: 472
+      initContainers:
+        - name: prepare-dashboards
+          image: "{{ .Values.grafana.image.repository }}:{{ .Values.grafana.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              cp -RL /etc/grafana/dashboard-sources/TMNT /var/lib/grafana/dashboards/
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 472
+            runAsGroup: 472
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: dashboard-sources
+              mountPath: /etc/grafana/dashboard-sources
+              readOnly: true
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+
+      containers:
+        - name: grafana
+          image: "{{ .Values.grafana.image.repository }}:{{ .Values.grafana.image.tag }}"
+          imagePullPolicy: {{ .Values.grafana.image.pullPolicy }}
+
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              value: {{ .Values.grafana.admin.user | quote }}
+
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              value: {{ .Values.grafana.admin.password | quote }}
+
+          ports:
+            - name: http
+              containerPort: 3000
+
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            timeoutSeconds: 5
+
+          volumeMounts:
+            - name: grafana-data
+              mountPath: /var/lib/grafana
+
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+              readOnly: true
+
+            - name: dashboard-provisioning
+              mountPath: /etc/grafana/provisioning/dashboards
+
+            - name: datasource-provisioning
+              mountPath: /etc/grafana/provisioning/datasources
+
+      volumes:
+        - name: grafana-data
+          persistentVolumeClaim:
+            claimName: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana-data") }}
+
+        - name: dashboards
+          emptyDir: {}
+
+        - name: dashboard-sources
+          projected:
+            sources:
+              - configMap:
+                  name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana-config") }}
+                  items:
+{{- range $path, $_ := .Files.Glob "dashboards/Infra/*.json" }}
+                    - key: {{ base $path | quote }}
+                      path: {{ printf "TMNT/Infra/%s" (base $path) | quote }}
+{{- end }}
+{{- range $path, $_ := .Files.Glob "dashboards/Apps/*.json" }}
+                    - key: {{ base $path | quote }}
+                      path: {{ printf "TMNT/Apps/%s" (base $path) | quote }}
+{{- end }}
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+                    - key: {{ base $path | quote }}
+                      path: {{ printf "TMNT/%s" (base $path) | quote }}
+{{- end }}
+
+        - name: dashboard-provisioning
+          configMap:
+            name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana-config") }}
+            items:
+              - key: dashboards.yml
+                path: dashboards.yml
+
+        - name: datasource-provisioning
+          configMap:
+            name: {{ include "monitoring-stack.resourceName" (dict "root" . "component" "grafana-config") }}
+            items:
+              - key: prometheus.yml
+                path: prometheus.yml

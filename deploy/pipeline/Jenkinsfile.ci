@@ -1,0 +1,462 @@
+def serialTestProjectNames = ['starrocks-writer', 'shared/kafka-consumer-service', 'starrocks-backfill']
+def mavenImage = 'registry.example.com/library/maven:3.9.6-eclipse-temurin-17'
+def registryHost = 'registry.example.com'
+def registryIp = ''
+def imagePushRepository = 'registry.example.com/tmnt'
+def registryUsername = 'registry-user'
+def sonarInstallationName = 'sonarqube'
+def sonarHost = 'sonarqube.example.com'
+def sonarIp = ''
+def sonarProjectKey = 'tmnt'
+def sonarProjectName = 'TMNT'
+
+def workspace
+def mavenCachePathInAgent
+def sonarCachePathInAgent
+def imageTag
+def dockerSocketGroupId
+def parallelTestWorkerCount
+def applicationsToBuild = []
+def applicationsToTest = []
+def applicationsToPush = []
+def projectsToTest = []
+def serialProjectsToTest = []
+def parallelProjectsToTest = []
+
+def parameterName(String appName) {
+    return "${appName.toUpperCase().replace('-', '_')}_MODE"
+}
+
+def directMavenModules(String root) {
+    return sh(
+        script: "find '${root}' -mindepth 2 -maxdepth 2 -type f -name pom.xml -printf '%h\\n' | sort",
+        returnStdout: true
+    ).readLines().collect { path ->
+        path.substring(root.length() + 1)
+    }
+}
+
+def mavenProjectPaths(List projectNames) {
+    return projectNames.collect { projectName -> "apps/${projectName}" }.join(',')
+}
+
+def testMavenProject(String projectName) {
+    stage("Test ${projectName}") {
+        echo "Testing ${projectName}"
+
+        withEnv([
+            "TEST_MAVEN_PROJECTS=apps/${projectName}"
+        ]) {
+            sh '''
+                set +x
+
+                mvn \
+                  --projects "$TEST_MAVEN_PROJECTS" \
+                  -s "$WORKSPACE/deploy/pipeline/maven-settings.xml" \
+                  -Dmaven.repo.local=/maven-cache \
+                  -Djavax.net.ssl.trustStore="$WORKSPACE/deploy/pipeline/internal-truststore.p12" \
+                  -Djavax.net.ssl.trustStorePassword="$DEFAULT_PASS$DEFAULT_PASS" \
+                  test
+            '''
+        }
+    }
+}
+
+def createTestWorker(String workerName, List projectNames, Map queueState) {
+    return {
+        while (true) {
+            def projectName = null
+
+            lock(resource: 'tmnt-ci-application-test-queue') {
+                if (queueState.nextIndex < projectNames.size()) {
+                    projectName = projectNames[queueState.nextIndex]
+                    queueState.nextIndex++
+                }
+            }
+
+            if (projectName == null) {
+                break
+            }
+
+            echo "${workerName} selected ${projectName}"
+            testMavenProject(projectName)
+        }
+    }
+}
+
+def createTestWorkers(List projectNames, int maxParallelWorkers) {
+    def workerCount = Math.min(maxParallelWorkers, projectNames.size())
+    def queueState = [nextIndex: 0]
+    def testBranches = [:]
+
+    for (int workerIndex = 0; workerIndex < workerCount; workerIndex++) {
+        def branchName = "Worker ${workerIndex + 1}"
+        testBranches[branchName] = createTestWorker(
+            "Test ${branchName}",
+            projectNames,
+            queueState
+        )
+    }
+
+    return testBranches
+}
+
+pipeline {
+    agent { label 'agent' }
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 20, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Initialize Pipeline') {
+            steps {
+                script {
+                    workspace = env.WORKSPACE
+
+                    dockerSocketGroupId = sh(
+                        script: "stat -c '%g' /var/run/docker.sock",
+                        returnStdout: true
+                    ).trim()
+
+                    mavenCachePathInAgent = "${env.HOME}/.m2/repository"
+                    sonarCachePathInAgent = "${env.HOME}/.sonar"
+
+                    try {
+                        parallelTestWorkerCount =
+                                (params.PARALLEL_TEST_WORKERS ?: '3').toInteger()
+                    } catch (NumberFormatException ignored) {
+                        error('PARALLEL_TEST_WORKERS must be a positive integer')
+                    }
+
+                    if (parallelTestWorkerCount < 1) {
+                        error('PARALLEL_TEST_WORKERS must be a positive integer')
+                    }
+
+                    imageTag = env.GERRIT_CHANGE_NUMBER ?
+                            "change-${env.GERRIT_CHANGE_NUMBER}" :
+                            sh(
+                                script: 'git rev-parse HEAD',
+                                returnStdout: true
+                            ).trim()
+
+                    sh """
+                        mkdir -p '${mavenCachePathInAgent}'
+                        mkdir -p '${sonarCachePathInAgent}'
+                    """
+                }
+            }
+        }
+
+        stage('Select Changed Applications') {
+            steps {
+                script {
+                    def applicationDetector = load 'deploy/pipeline/detectApplications.groovy'
+                    def allApplications = directMavenModules('apps').findAll {
+                        it != 'shared'
+                    }
+
+                    def changedApplications = applicationDetector.selectChangedApplications(
+                        allApplications,
+                        sh(
+                            script: 'git diff --name-only HEAD~1 HEAD',
+                            returnStdout: true
+                        ).readLines()
+                    )
+
+                    allApplications.each { appName ->
+                        def mode = params[parameterName(appName)] ?: 'IF_CHANGED'
+                        if (!(mode in [
+                            'IF_CHANGED', 'NEVER', 'TEST_ONLY', 'PUSH_ONLY', 'TEST_AND_PUSH'
+                        ])) {
+                            error("Unsupported CI mode for ${appName}: ${mode}")
+                        }
+                        if (mode == 'IF_CHANGED') {
+                            mode = changedApplications.contains(appName) ? 'TEST_AND_PUSH' : 'NEVER'
+                        }
+                        if (mode in ['TEST_ONLY', 'TEST_AND_PUSH']) {
+                            applicationsToTest.add(appName)
+                        }
+                        if (mode in ['PUSH_ONLY', 'TEST_AND_PUSH']) {
+                            applicationsToPush.add(appName)
+                        }
+                    }
+
+                    applicationsToBuild = allApplications.findAll { appName ->
+                        applicationsToTest.contains(appName) || applicationsToPush.contains(appName)
+                    }
+                    def sharedModulesToTest = applicationsToTest.isEmpty() ? [] :
+                        directMavenModules('apps/shared').collect { moduleName ->
+                            "shared/${moduleName}".toString()
+                        }
+                    projectsToTest = applicationsToTest + sharedModulesToTest
+
+                    serialProjectsToTest = projectsToTest.findAll { projectName ->
+                        serialTestProjectNames.contains(projectName)
+                    }
+                    parallelProjectsToTest = projectsToTest.findAll { projectName ->
+                        !serialTestProjectNames.contains(projectName)
+                    }
+
+                    echo "Applications selected for tests: ${applicationsToTest ?: 'none'}"
+                    echo "Applications selected for image push: ${applicationsToPush ?: 'none'}"
+                }
+            }
+        }
+
+        stage('Build and Test') {
+            when {
+                beforeAgent true
+                expression {
+                    !applicationsToBuild.isEmpty()
+                }
+            }
+
+            post {
+                always {
+                    junit(
+                        testResults: '**/target/surefire-reports/*.xml',
+                        allowEmptyResults: true
+                    )
+                }
+            }
+
+            agent {
+                docker {
+                    image "${mavenImage}"
+                    reuseNode true
+
+                    args """
+                        -v ${mavenCachePathInAgent}:/maven-cache
+                        -v /etc/passwd:/etc/passwd:ro
+                        -v /etc/group:/etc/group:ro
+                        -v /var/run/docker.sock:/var/run/docker.sock
+                        --group-add ${dockerSocketGroupId}
+                    """
+                }
+            }
+
+            environment {
+                DEFAULT_PASS = credentials('NIMBO_DEFAULT_PASS')
+            }
+
+            steps {
+                withEnv([
+                    "MAVEN_PROJECTS=${mavenProjectPaths(applicationsToBuild)}"
+                ]) {
+                    sh '''
+                        set +x
+
+                        echo "=== Java ==="
+                        java -version
+
+                        echo "=== Maven ==="
+                        mvn -version
+
+                        echo "=== Build Applications ==="
+
+                        mvn \
+                          --projects "$MAVEN_PROJECTS" \
+                          --also-make \
+                          -s "$WORKSPACE/deploy/pipeline/maven-settings.xml" \
+                          -Dmaven.repo.local=/maven-cache \
+                          -Djavax.net.ssl.trustStore="$WORKSPACE/deploy/pipeline/internal-truststore.p12" \
+                          -Djavax.net.ssl.trustStorePassword="$DEFAULT_PASS$DEFAULT_PASS" \
+                          -DskipTests \
+                          clean install
+                    '''
+                }
+
+                script {
+                    serialProjectsToTest.each { projectName ->
+                        testMavenProject(projectName)
+                    }
+
+                    if (!parallelProjectsToTest.isEmpty()) {
+                        stage('Test Applications') {
+                            def testWorkers = createTestWorkers(
+                                parallelProjectsToTest,
+                                parallelTestWorkerCount
+                            )
+
+                            if (testWorkers.size() == 1) {
+                                testWorkers.values().first().call()
+                            } else {
+                                parallel testWorkers
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('SonarQube Analysis and Quality Gate') {
+            when {
+                beforeAgent true
+                expression {
+                    !applicationsToTest.isEmpty()
+                }
+            }
+
+            agent {
+                docker {
+                    image "${mavenImage}"
+                    reuseNode true
+
+                    args """
+                        --add-host ${sonarHost}:${sonarIp}
+                        -v ${mavenCachePathInAgent}:/maven-cache
+                        -v ${sonarCachePathInAgent}:/sonar-cache
+                        -v /etc/passwd:/etc/passwd:ro
+                        -v /etc/group:/etc/group:ro
+                    """
+                }
+            }
+
+            steps {
+                script {
+                    withCredentials([
+                        string(
+                            credentialsId: 'NIMBO_DEFAULT_PASS',
+                            variable: 'DEFAULT_PASS'
+                        )
+                    ]) {
+                        withEnv([
+                            "MAVEN_PROJECTS=${mavenProjectPaths(['shared'] + projectsToTest)}"
+                        ]) {
+                            withSonarQubeEnv(
+                                sonarInstallationName
+                            ) {
+                                sh """
+                                    set +x
+
+                                    mvn \
+                                      --projects "\$MAVEN_PROJECTS" \
+                                      --also-make \
+                                      -s '${workspace}/deploy/pipeline/maven-settings.xml' \
+                                      -Dmaven.repo.local=/maven-cache \
+                                      -Djavax.net.ssl.trustStore='${workspace}/deploy/pipeline/internal-truststore.p12' \
+                                      -Djavax.net.ssl.trustStorePassword="\$DEFAULT_PASS\$DEFAULT_PASS" \
+                                      -Dsonar.userHome=/sonar-cache \
+                                      -Dsonar.projectKey='${sonarProjectKey}' \
+                                      -Dsonar.projectName='${sonarProjectName}' \
+                                      -Dsonar.pullrequest.base='${env.GERRIT_BRANCH}' \
+                                      -Dsonar.pullrequest.key='${env.GERRIT_CHANGE_NUMBER}' \
+                                      -Dsonar.pullrequest.branch='${env.GERRIT_PATCHSET_NUMBER}' \
+                                      -Dsonar.analysis.gerritId='${env.GERRIT_CHANGE_NUMBER}-${env.GERRIT_PATCHSET_NUMBER}' \
+                                      sonar:sonar
+                                """
+                            }
+                        }
+
+                        timeout(time: 10, unit: 'MINUTES') {
+                            def qualityGate = waitForQualityGate(
+                                abortPipeline: false
+                            )
+
+                            if (qualityGate.status != 'OK') {
+                                unstable(
+                                    "SonarQube Quality Gate failed: ${qualityGate.status}"
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('Push Images') {
+            when {
+                beforeAgent true
+                expression {
+                    currentBuild.currentResult == 'SUCCESS' &&
+                    !applicationsToPush.isEmpty()
+                }
+            }
+
+            agent {
+                docker {
+                    image "${mavenImage}"
+                    reuseNode true
+
+                    args """
+                        --add-host ${registryHost}:${registryIp}
+                        -v ${mavenCachePathInAgent}:/maven-cache
+                        -v /etc/passwd:/etc/passwd:ro
+                        -v /etc/group:/etc/group:ro
+                    """
+                }
+            }
+
+            steps {
+                script {
+                    withCredentials([
+                        string(
+                            credentialsId: 'NIMBO_DEFAULT_PASS',
+                            variable: 'DEFAULT_PASS'
+                        ),
+                        string(
+                            credentialsId: 'NIMBO_REGISTRY_PASS',
+                            variable: 'REGISTRY_PASS'
+                        )
+                    ]) {
+                        withEnv([
+                            "MAVEN_PROJECTS=${mavenProjectPaths(applicationsToPush)}",
+                            "IMAGE_REGISTRY=${imagePushRepository}",
+                            "IMAGE_TAG=${imageTag}",
+                            "REGISTRY_USERNAME=${registryUsername}",
+                            "MAVEN_HOME_DIR=/tmp/maven-home"
+                        ]) {
+                            sh '''
+                                set -eu
+                                set +x
+
+                                export HOME="$MAVEN_HOME_DIR"
+                                export XDG_CONFIG_HOME="$HOME/.config"
+                                export MAVEN_OPTS="-Duser.home=$HOME"
+                                export TRUSTSTORE_PASS="${DEFAULT_PASS}${DEFAULT_PASS}"
+
+                                mkdir -p "$XDG_CONFIG_HOME/google-cloud-tools-java/jib"
+
+                                printf '%s\\n' '{}' \
+                                    > "$XDG_CONFIG_HOME/google-cloud-tools-java/jib/config.json"
+
+                                mvn \
+                                  -s "$WORKSPACE/deploy/pipeline/maven-settings.xml" \
+                                  -B \
+                                  -Dmaven.repo.local=/maven-cache \
+                                  -Duser.home="$HOME" \
+                                  -Djavax.net.ssl.trustStore="$WORKSPACE/deploy/pipeline/internal-truststore.p12" \
+                                  -Djavax.net.ssl.trustStorePassword="$TRUSTSTORE_PASS" \
+                                  --projects "$MAVEN_PROJECTS" \
+                                  jib:build \
+                                  -DskipTests \
+                                  -Dimage.registry="$IMAGE_REGISTRY" \
+                                  -Dimage.tag="$IMAGE_TAG" \
+                                  -Djib.to.tags=latest \
+                                  -Djib.to.auth.username="$REGISTRY_USERNAME" \
+                                  -Djib.to.auth.password="$REGISTRY_PASS"
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            cleanWs(
+                deleteDirs: true
+            )
+        }
+    }
+}

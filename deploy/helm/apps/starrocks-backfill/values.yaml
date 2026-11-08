@@ -1,0 +1,38 @@
+image:
+  repository: registry.example.com:9465/tmnt/starrocks-backfill
+  tag: ""
+  pullPolicy: Always
+
+credentials:
+  username: root
+  password: changeme
+hdfsConfigMap: hdfs-client-config
+starrocks:
+  jdbcUrl: jdbc:mysql://192.168.1.104:9030/nimbo
+
+# Restore into netflow_raw with starrocks-writer stopped until the Job finishes.
+# Automatic retention is disabled so restored archives remain available for queries.
+backfill:
+  start: ""
+  end: ""
+  path: "/netflow"
+
+jdbc:
+  connectTimeout: "10000"
+  socketTimeout: "1260000"
+  sslMode: DISABLED
+
+session:
+  time_zone: UTC
+  query_timeout: "1200"
+  insert_timeout: "1200"
+  query_mem_limit: "536870912"
+  load_mem_limit: "536870912"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 1Gi
+  limits:
+    cpu: "1"
+    memory: 1536Mi

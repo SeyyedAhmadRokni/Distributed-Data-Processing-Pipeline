@@ -1,0 +1,48 @@
+prometheus:
+  image:
+    repository: prom/prometheus
+    tag: v3.5.0
+    pullPolicy: IfNotPresent
+
+  service:
+    type: LoadBalancer
+    port: 9090
+
+  retention: 30d
+  storage:
+    storageClass: disk1
+    size: 10Gi
+
+pushgateway:
+  image:
+    repository: prom/pushgateway
+    tag: v1.11.3
+    pullPolicy: IfNotPresent
+
+  storage:
+    storageClass: disk1
+    size: 1Gi
+
+grafana:
+  image:
+    repository: grafana/grafana
+    tag: 13.2.0
+    pullPolicy: IfNotPresent
+
+  service:
+    type: LoadBalancer
+    port: 3000
+
+  admin:
+    user: admin
+    password: admin
+
+  storage:
+    storageClass: disk1
+    size: 1Gi
+
+nodeExporter:
+  image:
+    repository: prom/node-exporter
+    tag: v1.12.1
+    pullPolicy: IfNotPresent

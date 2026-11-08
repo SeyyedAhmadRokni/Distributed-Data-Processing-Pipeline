@@ -1,0 +1,225 @@
+import groovy.transform.Field
+
+@Field def namespace = 'tmnt'
+@Field def kubeconfigPath = ''
+
+def jobs = [
+    'starrocks-backfill'
+]
+
+def jobChartsRoot = 'deploy/helm/apps'
+
+@Field def jobResources = [
+    'starrocks-backfill': 'starrocks-backfill'
+]
+
+@Field def jobConflicts = [
+    'starrocks-backfill': [[name: 'starrocks-writer', selector: 'app.kubernetes.io/name=starrocks-writer']]
+]
+
+def jobValues = [:]
+
+def parameterName(String targetName) {
+    return "${targetName.toUpperCase().replace('-', '_')}_RUN"
+}
+
+def withCluster(Closure body) {
+    withEnv(["KUBECONFIG=${kubeconfigPath}", "NAMESPACE=${namespace}"]) {
+        body()
+    }
+}
+
+def checkConflicts(String jobName) {
+    def resource = jobResources[jobName]
+    withEnv(["JOB_RESOURCE=${resource}"]) {
+        def existing = sh(script: 'kubectl get job "$JOB_RESOURCE" -n "$NAMESPACE" --ignore-not-found -o json', returnStdout: true).trim()
+        if (existing) {
+            def status = readJSON(text: existing, returnPojo: true).status
+            def finished = status?.conditions?.any { it.type in ['Complete', 'Failed'] && it.status == 'True' }
+            if (!finished) {
+                error("${jobName}: Job ${resource} is already running or waiting to start")
+            }
+        }
+    }
+    // Always block a second run of this Job, including Pending or terminating pods.
+    def conflicts = [[name: jobName, selector: "job-name=${resource}"]] + (jobConflicts[jobName] ?: [])
+    conflicts.each { conflict ->
+        withEnv(["CONFLICT_SELECTOR=${conflict.selector}", "CONFLICT_NAMESPACE=${conflict.namespace ?: namespace}"]) {
+            def pods = readJSON(
+                text: sh(script: 'kubectl get pods -n "$CONFLICT_NAMESPACE" -l "$CONFLICT_SELECTOR" -o json', returnStdout: true),
+                returnPojo: true
+            ).items
+            def active = pods.findAll { !(it.status?.phase in ['Succeeded', 'Failed']) }
+            if (active) {
+                error("${jobName} conflicts with ${conflict.name}: ${active.collect { it.metadata.name }.join(', ')}")
+            }
+        }
+    }
+}
+
+def runJob(String jobName, String helmChartPath, String imageTag, Map values) {
+    writeJSON file: "${jobName}-values.json", json: values + [image: [tag: imageTag]]
+    withEnv([
+        "RELEASE_NAME=${jobName}",
+        "CHART_PATH=${helmChartPath}",
+        "JOB_RESOURCE=${jobResources[jobName]}",
+        "VALUES_FILE=${jobName}-values.json",
+        // Allow two 20-minute SQL steps plus Job startup/cleanup.
+        "HELM_TIMEOUT=${jobName == 'starrocks-backfill' ? '50m' : '5m'}"
+    ]) {
+        boolean started = false
+        try {
+            checkConflicts(jobName)
+            sh 'kubectl delete job "$JOB_RESOURCE" -n "$NAMESPACE" --ignore-not-found --wait=true'
+            started = true
+            sh '''
+                helm upgrade --install "$RELEASE_NAME" "$CHART_PATH" \
+                    --force-conflicts \
+                    --namespace "$NAMESPACE" --values "$VALUES_FILE" \
+                    --timeout "$HELM_TIMEOUT"
+                kubectl wait -n "$NAMESPACE" --for=create pod \
+                    -l "job-name=$JOB_RESOURCE" --timeout=120s
+            '''
+            tee("${jobName}.log") {
+                sh 'kubectl logs -n "$NAMESPACE" -f --pod-running-timeout=10m "job/$JOB_RESOURCE"'
+            }
+            sh 'kubectl wait -n "$NAMESPACE" --for=condition=complete "job/$JOB_RESOURCE" --timeout=120s'
+        } catch (Exception failure) {
+            if (started) {
+                sh script: 'kubectl describe job "$JOB_RESOURCE" -n "$NAMESPACE"', returnStatus: true
+            }
+            throw failure
+        } finally {
+            if (started) {
+                // Save logs and stop only the Job started by this run.
+                sh script: '''
+                    set +e
+                    kubectl logs -n "$NAMESPACE" "job/$JOB_RESOURCE" > "$RELEASE_NAME-final.log" 2>&1
+                    active=$(kubectl get job "$JOB_RESOURCE" -n "$NAMESPACE" -o jsonpath='{.status.active}')
+                    if [ "${active:-0}" -gt 0 ]; then
+                        kubectl delete job "$JOB_RESOURCE" -n "$NAMESPACE" --wait=true
+                    fi
+                ''', returnStatus: true
+            }
+        }
+    }
+}
+
+pipeline {
+    agent {
+        label 'agent'
+    }
+
+    parameters {
+        booleanParam(name: 'STARROCKS_BACKFILL_RUN', defaultValue: false, description: 'Restore netflow_raw; keep starrocks-writer scaled to zero until this Job finishes')
+        string(name: 'STARROCKS_BACKFILL_IMAGE_TAG', defaultValue: '', description: 'Required when running Backfill: an image tag published by successful CI (e.g. change-40177)', trim: true)
+        string(name: 'STARROCKS_BACKFILL_START', defaultValue: '', description: 'Inclusive start timestamp with timezone (e.g. 2026-09-20T00:00:00Z)', trim: true)
+        string(name: 'STARROCKS_BACKFILL_END', defaultValue: '', description: 'Exclusive end timestamp with timezone (e.g. 2026-09-21T00:00:00Z)', trim: true)
+    }
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 150, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Select Job Targets') {
+            steps {
+                script {
+                    jobs = jobs.findAll { jobName ->
+                        params[parameterName(jobName)] == true
+                    }
+
+                    jobValues = [
+                        'starrocks-backfill': [
+                            backfill: [
+                                start: params.STARROCKS_BACKFILL_START?.trim(),
+                                end: params.STARROCKS_BACKFILL_END?.trim()
+                            ]
+                        ]
+                    ]
+                    echo "Jobs selected for execution: ${jobs ?: 'none'}"
+                }
+            }
+        }
+
+        stage('Validate Selected Jobs') {
+            when {
+                expression { !jobs.isEmpty() }
+            }
+            steps {
+                script {
+                    if (jobs.contains('starrocks-backfill')) {
+                        if (!params.STARROCKS_BACKFILL_IMAGE_TAG?.trim()) {
+                            error('STARROCKS_BACKFILL_IMAGE_TAG is required')
+                        }
+                        if (!jobValues['starrocks-backfill'].backfill.start ||
+                            !jobValues['starrocks-backfill'].backfill.end) {
+                            error('STARROCKS_BACKFILL_START and STARROCKS_BACKFILL_END are required')
+                        }
+                    }
+                    withCluster {
+                        jobs.each { jobName ->
+                            checkConflicts(jobName)
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Run Jobs') {
+            when {
+                expression { !jobs.isEmpty() }
+            }
+            steps {
+                script {
+                    def jobBranches = [:]
+
+                    jobs.each { jobName ->
+                        def name = jobName
+                        jobBranches[name] = {
+                            stage("Run ${name}") {
+                                catchError(
+                                    buildResult: 'FAILURE',
+                                    stageResult: 'FAILURE',
+                                    catchInterruptions: false,
+                                    message: "Job ${name} failed"
+                                ) {
+                                    withCluster {
+                                        def imageTag = name == 'starrocks-backfill' ?
+                                                params.STARROCKS_BACKFILL_IMAGE_TAG.trim() : 'latest'
+                                        runJob(name, "${jobChartsRoot}/${name}", imageTag, jobValues[name] ?: [:])
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    parallel jobBranches
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'JOBS SUCCESS'
+        }
+
+        failure {
+            echo 'JOBS FAILED'
+        }
+
+        always {
+            archiveArtifacts artifacts: '*.log', allowEmptyArchive: true
+            deleteDir()
+        }
+    }
+}

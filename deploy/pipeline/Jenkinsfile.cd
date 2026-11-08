@@ -1,0 +1,362 @@
+import groovy.transform.Field
+
+@Field def namespace = 'namespace'
+@Field def kubeconfigPath = ''
+
+def applications = [
+    'api-service',
+    'parquet-writer',
+    'parquet-maintenance',
+    'starrocks-writer',
+    'cube-maker'
+]
+
+def applicationChartsRoot = 'deploy/helm/apps'
+
+def helmInfrastructureCharts = [
+    'hdfs-client': 'deploy/helm/infrastructure/hdfs-client',
+    'postgres': 'deploy/helm/infrastructure/postgres',
+    'schema-registry': 'deploy/helm/infrastructure/schema-registry',
+    'spark': 'deploy/helm/infrastructure/spark-cluster',
+    'monitoring': 'deploy/helm/infrastructure/monitoring-stack'
+]
+
+def ansibleInfrastructure = [
+    'starrocks',
+    'kafka'
+]
+
+def imageTag
+def applicationImageTags = [:]
+def changedFiles = []
+def changedApplications = []
+def changedHelmInfrastructure = []
+def changedAnsibleInfrastructure = []
+def sourceRef
+
+def checkoutChange(String change) {
+    def remote = scm.userRemoteConfigs.find { it.url.endsWith('/TMNT') }
+    if (remote == null) error('TMNT Git remote not found')
+    def changeRefs = "refs/remotes/origin/change-${change}"
+    checkout scmGit(
+        branches: [[name: '*/master']],
+        userRemoteConfigs: [[
+            url: remote.url, credentialsId: remote.credentialsId,
+            refspec: "+refs/heads/master:refs/remotes/origin/master +refs/changes/${change.substring(3)}/${change}/*:${changeRefs}/*"
+        ]]
+    )
+    def latestPS = sh(
+        script: "git for-each-ref --format='%(refname:lstrip=-1)' ${changeRefs}/ | sort -n | tail -n 1",
+        returnStdout: true
+    ).trim()
+    if (!(latestPS ==~ /\d+/)) {
+        error("No patch sets found for Change ${change}")
+    }
+    echo "Deploying Change ${change}, Patch Set ${latestPS}"
+    sh "git checkout --detach ${changeRefs}/${latestPS}"
+}
+
+def parameterName(String targetName) {
+    return "${targetName.toUpperCase().replace('-', '_')}_MODE"
+}
+
+def deployApplication(String appName, String helmChartPath, String imageTag) {
+    withEnv([
+        "APP_NAME=${appName}",
+        "RELEASE_NAME=${appName}",
+        "CHART_PATH=${helmChartPath}",
+        "IMAGE_TAG=${imageTag}",
+        "HELM_TIMEOUT=6m",
+        "NAMESPACE=${namespace}",
+        "KUBECONFIG=${kubeconfigPath}"
+    ]) {
+        sh '''
+            set -eu
+            set +x
+
+            echo "========================================"
+            echo "Kubernetes deployment"
+            echo "========================================"
+            echo "APP_NAME=$APP_NAME"
+            echo "RELEASE_NAME=$RELEASE_NAME"
+            echo "IMAGE_TAG=$IMAGE_TAG"
+            echo "NAMESPACE=$NAMESPACE"
+            echo "========================================"
+
+            helm \
+              --kubeconfig "$KUBECONFIG" \
+              upgrade --install "$RELEASE_NAME" "$CHART_PATH" \
+              --force-conflicts \
+              --namespace "$NAMESPACE" \
+              --create-namespace \
+              --set-string "image.tag=$IMAGE_TAG" \
+              --rollback-on-failure \
+              --wait \
+              --timeout "$HELM_TIMEOUT"
+        '''
+    }
+}
+
+pipeline {
+    agent {
+        label 'agent'
+    }
+
+    options {
+        skipDefaultCheckout(true)
+        disableConcurrentBuilds()
+        timeout(time: 45, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                script {
+                    sourceRef = (params.SOURCE_REF == null ? 'master' : params.SOURCE_REF).trim()
+                    if (sourceRef != 'master' && !(sourceRef ==~ /[0-9]{5}/)) {
+                        error('SOURCE_REF must be master or a five-digit Gerrit Change number')
+                    }
+                    if (sourceRef == 'master') {
+                        checkout scm
+                    } else {
+                        checkoutChange(sourceRef)
+                    }
+                }
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                script {
+                    def changeNumber = sourceRef == 'master' ? env.GERRIT_CHANGE_NUMBER : sourceRef
+                    imageTag = changeNumber ? "change-${changeNumber}" :
+                            sh(script: 'git rev-parse HEAD', returnStdout: true).trim()
+
+                    def changeDetector = load 'deploy/pipeline/detectApplications.groovy'
+
+                    changedFiles = sh(
+                        script: 'git diff --name-only HEAD~1 HEAD',
+                        returnStdout: true
+                    ).readLines()
+
+                    changedApplications = changeDetector.selectChangedApplications(
+                        applications,
+                        changedFiles
+                    )
+
+                    changedHelmInfrastructure =
+                            changeDetector.selectChangedHelmInfrastructure(
+                                helmInfrastructureCharts,
+                                changedFiles
+                            )
+
+                    changedAnsibleInfrastructure =
+                            changeDetector.selectChangedAnsibleInfrastructure(
+                                ansibleInfrastructure,
+                                changedFiles
+                            )
+
+                    echo "Changed applications: ${changedApplications ?: 'none'}"
+                    echo "Changed Helm infrastructure: ${changedHelmInfrastructure ?: 'none'}"
+                    echo "Changed Ansible infrastructure: ${changedAnsibleInfrastructure ?: 'none'}"
+                }
+            }
+        }
+
+        stage('Select Deployment Targets') {
+            steps {
+                script {
+
+                    def selectByMode = { targetName, changed, defaultMode ->
+                        def mode = params[parameterName(targetName)] ?: defaultMode
+
+                        if (!(mode in ['ALWAYS', 'IF_CHANGED', 'NEVER'])) {
+                            error("Unsupported deployment mode for ${targetName}: ${mode}")
+                        }
+
+                        return mode == 'ALWAYS' ||
+                                (mode == 'IF_CHANGED' && changed)
+                    }
+
+                    applications = applications.findAll { appName ->
+                        selectByMode(
+                            appName,
+                            changedApplications.contains(appName),
+                            'IF_CHANGED'
+                        )
+                    }
+
+                    applications.each { appName ->
+                        def mode = params[parameterName(appName)] ?: 'IF_CHANGED'
+
+                        applicationImageTags[appName] = mode == 'ALWAYS' && sourceRef == 'master' ?
+                                'latest' : imageTag
+                    }
+
+                    helmInfrastructureCharts = helmInfrastructureCharts.findAll {
+                        infrastructureName, chartPath ->
+                            selectByMode(
+                                infrastructureName,
+                                changedHelmInfrastructure.contains(infrastructureName),
+                                'ALWAYS'
+                            )
+                    }
+
+                    ansibleInfrastructure = ansibleInfrastructure.findAll {
+                        infrastructureName ->
+                            selectByMode(
+                                infrastructureName,
+                                changedAnsibleInfrastructure.contains(infrastructureName),
+                                'ALWAYS'
+                            )
+                    }
+
+                    echo "Applications selected for deployment: ${applications ?: 'none'}"
+                    echo "Helm infrastructure selected: ${helmInfrastructureCharts.keySet() ?: 'none'}"
+                    echo "Ansible infrastructure selected: ${ansibleInfrastructure ?: 'none'}"
+                }
+            }
+        }
+
+        stage('Ensure Infrastructure') {
+            steps {
+                script {
+                    sh """
+                        set -eu
+                        kubectl create namespace ${namespace} \
+                            --dry-run=client \
+                            -o yaml | kubectl apply -f -
+                    """
+
+                    def infrastructureBranches = [:]
+
+                    helmInfrastructureCharts.each { infrastructureName, chartPath ->
+                        def name = infrastructureName
+                        def chart = chartPath
+
+                        infrastructureBranches[name] = {
+                            stage("Ensure ${name}") {
+                                echo "Ensuring ${name}..."
+
+                                sh """
+                                    set -eu
+                                    helm upgrade --install ${name} ${chart} \
+                                        --force-conflicts \
+                                        -n ${namespace} \
+                                        --wait --timeout 5m
+                                """
+                            }
+                        }
+                    }
+
+                    ansibleInfrastructure.each { infrastructureName ->
+                        def name = infrastructureName
+
+                        infrastructureBranches[name] = {
+                            stage("Ensure ${name}") {
+                                echo "Ensuring ${name}..."
+
+                                withEnv(["ANSIBLE_TAG=${name}"]) {
+                                    withCredentials([
+                                        string(
+                                            credentialsId: 'DEFAULT_PASS',
+                                            variable: 'DEFAULT_PASS'
+                                        )
+                                    ]) {
+                                        sh '''
+                                            set -eu
+                                            set +x
+
+                                            export SSH_PASS="$DEFAULT_PASS"
+
+                                            cd deploy/ansible
+
+                                            VAULT_PASS_FILE="$(mktemp)"
+                                            trap 'rm -f "$VAULT_PASS_FILE"' EXIT
+
+                                            printf '%s\n' "$DEFAULT_PASS" > "$VAULT_PASS_FILE"
+                                            chmod 600 "$VAULT_PASS_FILE"
+
+                                            attempt=1
+
+                                            while ! ansible-playbook playbooks/main.yml \
+                                                -i inventory/hosts.yml \
+                                                --tags "$ANSIBLE_TAG" \
+                                                --vault-id default@"$VAULT_PASS_FILE"; do
+                                                if [ "$attempt" -ge 2 ]; then
+                                                    exit 1
+                                                fi
+
+                                                attempt=$((attempt + 1))
+                                                echo "Retrying $ANSIBLE_TAG after a failed Ansible run..."
+                                            done
+                                        '''
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!infrastructureBranches.isEmpty()) {
+                        parallel infrastructureBranches
+                    }
+
+                    echo 'Infrastructure is UP'
+                }
+            }
+        }
+
+        stage('Deploy Applications') {
+            when {
+                expression {
+                    !applications.isEmpty()
+                }
+            }
+
+            steps {
+                script {
+                    def applicationBranches = [:]
+
+                    applications.each { appName ->
+
+                        def name = appName
+
+                        applicationBranches[name] = {
+
+                            stage("Deploy ${name}") {
+                                catchError(
+                                    buildResult: 'FAILURE',
+                                    stageResult: 'FAILURE',
+                                    message: "Application ${name} deployment failed; image may be unavailable"
+                                ) {
+                                    deployApplication(
+                                        name,
+                                        "${applicationChartsRoot}/${name}",
+                                        applicationImageTags[name]
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    parallel applicationBranches
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'CD SUCCESS'
+        }
+
+        failure {
+            echo 'CD FAILED'
+        }
+
+        always {
+            deleteDir()
+        }
+    }
+}
